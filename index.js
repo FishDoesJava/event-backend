@@ -1,3 +1,4 @@
+// index.js (or server.js)
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -5,15 +6,27 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
+
+// --- CORS & JSON ---
 app.use(express.json());
-app.use(cors({ methods: ["GET", "POST"] }));
+app.use(
+  cors({
+    origin: "*", // loosen as needed for prod
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
+  })
+);
+// handle preflight for everything (especially /events)
+app.options("*", cors());
 
 const port = process.env.PORT || 3000;
 
 /* ---------- UTIL HELPERS ---------- */
 function parseLocation(loc = "") {
-  const [cityRaw = "", stateRaw = ""] = String(loc).split(",").map(s => s.trim());
-  let city = cityRaw, stateCode = stateRaw;
+  const [cityRaw = "", stateRaw = ""] = String(loc).split(",").map((s) => s.trim());
+  let city = cityRaw,
+    stateCode = stateRaw;
   if (!stateCode && cityRaw.includes(" ")) {
     const parts = cityRaw.split(" ");
     stateCode = parts.pop();
@@ -47,31 +60,37 @@ app.get("/version", (_req, res) =>
   })
 );
 
+/* ---------- HINT ROUTE FOR QUICK MANUAL TESTS ---------- */
+app.get("/events", (_req, res) =>
+  res.json({ hint: "POST /events with { location: 'City, ST', interests: [..], date: 'YYYY-MM-DD' }" })
+);
+
 /* ---------- /events (SeatGeek) ---------- */
 app.post("/events", async (req, res) => {
   try {
     const { location = "", interests = [], date } = req.body || {};
+
     if (!process.env.SEATGEEK_CLIENT_ID) {
       return res.status(500).json({ error: "Server missing SEATGEEK_CLIENT_ID" });
     }
 
-    const [cityRaw = "", stateRaw = ""] = String(location).split(",").map(s => s.trim());
-    const city = cityRaw, stateCode = stateRaw;
+    const { city, stateCode } = parseLocation(location);
+    const bounds = date ? dayBoundsLocal(date) : null;
 
     // helper to build and call SeatGeek
     const callSeatGeek = async ({ useKeywords = true, useCity = true }) => {
       const params = new URLSearchParams({
         client_id: process.env.SEATGEEK_CLIENT_ID,
         per_page: "25",
-        sort: "datetime_local.asc"
+        sort: "datetime_local.asc",
       });
 
       if (useCity && city) params.set("venue.city", city);
       if (useCity && stateCode) params.set("venue.state", stateCode);
 
-      if (date) {
-        params.set("datetime_local.gte", `${date}T00:00:00`);
-        params.set("datetime_local.lte", `${date}T23:59:59`);
+      if (bounds) {
+        params.set("datetime_local.gte", bounds.start);
+        params.set("datetime_local.lte", bounds.end);
       }
 
       const q = interests.join(" ").trim();
@@ -80,23 +99,21 @@ app.post("/events", async (req, res) => {
       const url = `https://api.seatgeek.com/2/events?${params.toString()}`;
       const resp = await fetch(url);
       const text = await resp.text();
+
       if (!resp.ok) {
         console.error("SeatGeek error", resp.status, text);
         return { items: [], debug: { url, status: resp.status, body: text } };
       }
+
       let data;
-      try { data = JSON.parse(text); } catch { data = {}; }
-      const events = (data.events || []);
-      const items = events.map(ev => {
-        const v = ev.venue || {};
-        const venue = [v.name, v.city, v.state].filter(Boolean).join(", ") || null;
-        return {
-          title: ev.title || "Untitled event",
-          startTime: ev.datetime_local || null,
-          venue,
-          url: ev.url || null
-        };
-      });
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = {};
+      }
+
+      const events = data.events || [];
+      const items = events.map(mapSG);
       console.log(`[SeatGeek] ${items.length} results from: ${url}`);
       return { items, debug: { url, status: resp.status } };
     };
@@ -107,10 +124,10 @@ app.post("/events", async (req, res) => {
     // 2) if empty, drop keywords
     if (!items.length) ({ items, debug } = await callSeatGeek({ useKeywords: false, useCity: true }));
 
-    // 3) if still empty, try only date (ignore city/state too—SeatGeek will return broader list)
+    // 3) if still empty, try only date (ignore city/state too)
     if (!items.length) ({ items, debug } = await callSeatGeek({ useKeywords: false, useCity: false }));
 
-    return res.json({ items, debug }); // keep debug for now; remove later
+    return res.json({ items, debug }); // keep debug for now; remove later if noisy
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error" });
