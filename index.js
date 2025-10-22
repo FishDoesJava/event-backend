@@ -1,4 +1,3 @@
-// index.js (or server.js)
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -11,13 +10,12 @@ const app = express();
 app.use(express.json());
 app.use(
   cors({
-    origin: "*", // loosen as needed for prod
+    origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     optionsSuccessStatus: 204,
   })
 );
-// handle preflight for everything (especially /events)
 app.options("*", cors());
 
 const port = process.env.PORT || 3000;
@@ -127,7 +125,7 @@ app.post("/events", async (req, res) => {
     // 3) if still empty, try only date (ignore city/state too)
     if (!items.length) ({ items, debug } = await callSeatGeek({ useKeywords: false, useCity: false }));
 
-    return res.json({ items, debug }); // keep debug for now; remove later if noisy
+    return res.json({ items, debug })
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error" });
