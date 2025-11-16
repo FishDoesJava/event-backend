@@ -1,8 +1,15 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import OpenAI from "openai";
 
 dotenv.config();
+
+// --- OpenAI client ---
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+if (!process.env.OPENAI_API_KEY) {
+  console.error("Missing OPENAI_API_KEY");
+}
 
 const app = express();
 
@@ -16,25 +23,32 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
-app.options("*", cors());
+//app.options("*", cors());
 
 const port = process.env.PORT || 3000;
 
 /* ---------- UTIL HELPERS ---------- */
+
 function parseLocation(loc = "") {
   const [cityRaw = "", stateRaw = ""] = String(loc).split(",").map((s) => s.trim());
-  let city = cityRaw,
-    stateCode = stateRaw;
+  let city = cityRaw;
+  let stateCode = stateRaw;
+
+  // allow "Dallas TX" style
   if (!stateCode && cityRaw.includes(" ")) {
     const parts = cityRaw.split(" ");
     stateCode = parts.pop();
     city = parts.join(" ");
   }
+
   return { city, stateCode };
 }
+
 function dayBoundsLocal(dateStr) {
+  // naive local-day bounds, fine for this use case
   return { start: `${dateStr}T00:00:00`, end: `${dateStr}T23:59:59` };
 }
+
 function mapSG(ev) {
   const v = ev.venue || {};
   const venue = [v.name, v.city, v.state].filter(Boolean).join(", ") || null;
@@ -46,9 +60,33 @@ function mapSG(ev) {
   };
 }
 
+// Summarize a single SeatGeek event in 1–2 sentences
+async function summarizeEvent(evt) {
+  const prompt = [
+    "Write a punchy 1–2 sentence blurb (≤200 chars) for a college student.",
+    "Hype the headline/team/artist if present. No dates; avoid repeating the venue.",
+    "Return plain text only.",
+    `Event JSON: ${JSON.stringify(evt)}`
+  ].join("\n");
+
+  const resp = await openai.responses.create({
+    model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    input: prompt,
+    max_output_tokens: 120,
+  });
+
+  // output_text is the convenience helper from the Responses API
+  return (resp.output_text || "").trim();
+}
+
 /* ---------- HEALTH/VERSION ---------- */
-app.get("/", (_req, res) => res.send("API is up. Try GET /health or POST /events"));
+
+app.get("/", (_req, res) =>
+  res.send("API is up. Try GET /health or POST /events")
+);
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
 app.get("/version", (_req, res) =>
   res.json({
     name: "event-backend",
@@ -59,17 +97,24 @@ app.get("/version", (_req, res) =>
 );
 
 /* ---------- HINT ROUTE FOR QUICK MANUAL TESTS ---------- */
+
 app.get("/events", (_req, res) =>
-  res.json({ hint: "POST /events with { location: 'City, ST', interests: [..], date: 'YYYY-MM-DD' }" })
+  res.json({
+    hint:
+      "POST /events with { location: 'City, ST', interests: [..], date: 'YYYY-MM-DD' }",
+  })
 );
 
-/* ---------- /events (SeatGeek) ---------- */
+/* ---------- /events (SeatGeek + OpenAI summaries) ---------- */
+
 app.post("/events", async (req, res) => {
   try {
     const { location = "", interests = [], date } = req.body || {};
 
     if (!process.env.SEATGEEK_CLIENT_ID) {
-      return res.status(500).json({ error: "Server missing SEATGEEK_CLIENT_ID" });
+      return res
+        .status(500)
+        .json({ error: "Server missing SEATGEEK_CLIENT_ID" });
     }
 
     const { city, stateCode } = parseLocation(location);
@@ -117,15 +162,54 @@ app.post("/events", async (req, res) => {
     };
 
     // 1) full filters
-    let { items, debug } = await callSeatGeek({ useKeywords: true, useCity: true });
+    let { items, debug } = await callSeatGeek({
+      useKeywords: true,
+      useCity: true,
+    });
 
     // 2) if empty, drop keywords
-    if (!items.length) ({ items, debug } = await callSeatGeek({ useKeywords: false, useCity: true }));
+    if (!items.length) {
+      ({ items, debug } = await callSeatGeek({
+        useKeywords: false,
+        useCity: true,
+      }));
+    }
 
     // 3) if still empty, try only date (ignore city/state too)
-    if (!items.length) ({ items, debug } = await callSeatGeek({ useKeywords: false, useCity: false }));
+    if (!items.length) {
+      ({ items, debug } = await callSeatGeek({
+        useKeywords: false,
+        useCity: false,
+      }));
+    }
 
-    return res.json({ items, debug })
+    // Summarize up to 12 events with OpenAI
+    const withSnippets = [];
+    for (const it of items.slice(0, 12)) {
+      try {
+        const snippet = await summarizeEvent(it);
+        withSnippets.push({ ...it, snippet });
+      } catch (err) {
+        console.error("summarizeEvent error", err);
+        withSnippets.push({ ...it, snippet: null });
+      }
+    }
+
+    // If there were more events than we summarized, append the rest (no snippet)
+    if (items.length > withSnippets.length) {
+      withSnippets.push(...items.slice(withSnippets.length));
+    }
+
+    // Also return just the descriptions if you want them easily on the frontend
+    const descriptions = withSnippets
+      .map((e) => e.snippet)
+      .filter((s) => typeof s === "string" && s.length > 0);
+
+    return res.json({
+      items: withSnippets,
+      descriptions, // <- array of just the 1–2 sentence blurbs
+      debug,
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error" });
@@ -133,4 +217,7 @@ app.post("/events", async (req, res) => {
 });
 
 /* ---------- START SERVER ---------- */
-app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
+
+app.listen(port, () =>
+  console.log(`API listening on http://localhost:${port}`)
+);
