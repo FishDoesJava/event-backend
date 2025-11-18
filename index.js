@@ -63,7 +63,7 @@ function mapSG(ev) {
 // Summarize a single SeatGeek event in 1–2 sentences
 async function summarizeEvent(evt) {
   const prompt = [
-    "Write a punchy 1–2 sentence blurb (≤200 chars) for a college student.",
+    "Write a punchy 1–2 sentence blurb (≤200 chars) for a potential attendee.",
     "Hype the headline/team/artist if present. No dates; avoid repeating the venue.",
     "Return plain text only.",
     `Event JSON: ${JSON.stringify(evt)}`
@@ -195,19 +195,19 @@ app.post("/events", async (req, res) => {
       }
     }
 
-    // If there were more events than we summarized, append the rest (no snippet)
+    // If there were more events than summarized, append the rest (no snippet)
     if (items.length > withSnippets.length) {
       withSnippets.push(...items.slice(withSnippets.length));
     }
 
-    // Also return just the descriptions if you want them easily on the frontend
+    // Also return just the descriptions
     const descriptions = withSnippets
       .map((e) => e.snippet)
       .filter((s) => typeof s === "string" && s.length > 0);
 
     return res.json({
       items: withSnippets,
-      descriptions, // <- array of just the 1–2 sentence blurbs
+      descriptions,
       debug,
     });
   } catch (e) {
