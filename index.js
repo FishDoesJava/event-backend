@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import { dedupeEvents } from "./lib/dedupeEvents.js";
 
 dotenv.config();
 
@@ -52,11 +53,18 @@ function dayBoundsLocal(dateStr) {
 function mapSG(ev) {
   const v = ev.venue || {};
   const venue = [v.name, v.city, v.state].filter(Boolean).join(", ") || null;
+  // Prefer an image from performers if available, otherwise fall back to an event-level image
+  const image =
+    (Array.isArray(ev.performers) && ev.performers.find((p) => p.image)?.image) ||
+    ev.performers?.[0]?.image ||
+    ev.image ||
+    null;
   return {
     title: ev.title || "Untitled event",
     startTime: ev.datetime_local || null,
     venue,
     url: ev.url || null,
+    image,
   };
 }
 
@@ -183,9 +191,14 @@ app.post("/events", async (req, res) => {
       }));
     }
 
-    // Summarize up to 12 events with OpenAI
+    // Deduplicate events by normalized title + venue (group multiple showings of same event)
+    // implemented in a small helper module so it can be unit-tested
+    const deduped = dedupeEvents(items);
+    console.log(`[Dedup] reduced ${items.length} -> ${deduped.length}`);
+
+    // Summarize up to 12 unique events with OpenAI
     const withSnippets = [];
-    for (const it of items.slice(0, 12)) {
+    for (const it of deduped.slice(0, 12)) {
       try {
         const snippet = await summarizeEvent(it);
         withSnippets.push({ ...it, snippet });
@@ -196,8 +209,8 @@ app.post("/events", async (req, res) => {
     }
 
     // If there were more events than summarized, append the rest (no snippet)
-    if (items.length > withSnippets.length) {
-      withSnippets.push(...items.slice(withSnippets.length));
+    if (deduped.length > withSnippets.length) {
+      withSnippets.push(...deduped.slice(withSnippets.length));
     }
 
     // Also return just the descriptions
