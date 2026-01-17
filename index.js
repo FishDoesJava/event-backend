@@ -58,7 +58,7 @@ async function summarizeEvent(evt) {
     "Write a punchy 1–2 sentence blurb (≤200 chars) for a potential attendee.",
     "Hype the headline/team/artist if present. No dates; avoid repeating the venue.",
     "Return plain text only.",
-    `Event JSON: ${JSON.stringify(evt)}`
+    `Event JSON: ${JSON.stringify(evt)}`,
   ].join("\n");
 
   const resp = await openai.responses.create({
@@ -69,6 +69,32 @@ async function summarizeEvent(evt) {
 
   // output_text is the convenience helper from the Responses API
   return (resp.output_text || "").trim();
+}
+
+async function summarizeEventsWithLimit(events, limit) {
+  const results = new Array(events.length);
+  let cursor = 0;
+
+  const workers = Array.from(
+    { length: Math.min(limit, events.length) },
+    async () => {
+      while (cursor < events.length) {
+        const currentIndex = cursor;
+        cursor += 1;
+        const evt = events[currentIndex];
+        try {
+          const snippet = await summarizeEvent(evt);
+          results[currentIndex] = { ...evt, snippet };
+        } catch (err) {
+          console.error("summarizeEvent error", err);
+          results[currentIndex] = { ...evt, snippet: null };
+        }
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
 }
 
 /* ---------- HEALTH/VERSION ---------- */
@@ -181,16 +207,12 @@ app.post("/events", async (req, res) => {
     console.log(`[Dedup] reduced ${items.length} -> ${deduped.length}`);
 
     // Summarize up to 12 unique events with OpenAI
-    const withSnippets = [];
-    for (const it of deduped.slice(0, 12)) {
-      try {
-        const snippet = await summarizeEvent(it);
-        withSnippets.push({ ...it, snippet });
-      } catch (err) {
-        console.error("summarizeEvent error", err);
-        withSnippets.push({ ...it, snippet: null });
-      }
-    }
+    const summaryLimit = 12;
+    const summaryConcurrency = 3;
+    const withSnippets = await summarizeEventsWithLimit(
+      deduped.slice(0, summaryLimit),
+      summaryConcurrency
+    );
 
     // If there were more events than summarized, append the rest (no snippet)
     if (deduped.length > withSnippets.length) {
