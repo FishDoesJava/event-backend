@@ -54,6 +54,9 @@ import { mapSG } from "./lib/mapSG.js";
 
 // Summarize a single SeatGeek event in 1–2 sentences
 async function summarizeEvent(evt) {
+  if (!process.env.OPENAI_API_KEY) {
+    return null;
+  }
   const prompt = [
     "Write a punchy 1–2 sentence blurb (≤200 chars) for a potential attendee.",
     "Hype the headline/team/artist if present. No dates; avoid repeating the venue.",
@@ -71,23 +74,44 @@ async function summarizeEvent(evt) {
   return (resp.output_text || "").trim();
 }
 
-async function summarizeEventsWithLimit(events, limit) {
+function buildFallbackSnippet(evt) {
+  const venue = evt.venue ? ` at ${evt.venue}` : "";
+  return `${evt.title}${venue}.`;
+}
+
+async function addSnippetsToEvents(events, concurrency) {
+  if (!process.env.OPENAI_API_KEY) {
+    return events.map((evt) => ({
+      ...evt,
+      snippet: evt.snippet || buildFallbackSnippet(evt),
+    }));
+  }
   const results = new Array(events.length);
   let cursor = 0;
 
   const workers = Array.from(
-    { length: Math.min(limit, events.length) },
+    { length: Math.min(concurrency, events.length) },
     async () => {
       while (cursor < events.length) {
         const currentIndex = cursor;
         cursor += 1;
         const evt = events[currentIndex];
+        if (evt.snippet) {
+          results[currentIndex] = evt;
+          continue;
+        }
         try {
           const snippet = await summarizeEvent(evt);
-          results[currentIndex] = { ...evt, snippet };
+          results[currentIndex] = {
+            ...evt,
+            snippet: snippet || buildFallbackSnippet(evt),
+          };
         } catch (err) {
           console.error("summarizeEvent error", err);
-          results[currentIndex] = { ...evt, snippet: null };
+          results[currentIndex] = {
+            ...evt,
+            snippet: buildFallbackSnippet(evt),
+          };
         }
       }
     }
@@ -123,6 +147,23 @@ app.get("/events", (_req, res) =>
   })
 );
 
+/* ---------- SIMPLE EVENT CACHE ---------- */
+
+const eventCache = new Map();
+
+function buildCacheKey({ location = "", interests = [], date = "" }) {
+  const normalizedLocation = String(location).trim().toLowerCase();
+  const normalizedInterests = Array.isArray(interests)
+    ? interests.map((item) => String(item).trim().toLowerCase()).sort()
+    : [];
+  const normalizedDate = String(date || "").trim();
+  return JSON.stringify({
+    location: normalizedLocation,
+    interests: normalizedInterests,
+    date: normalizedDate,
+  });
+}
+
 /* ---------- /events (SeatGeek + OpenAI summaries) ---------- */
 
 app.post("/events", async (req, res) => {
@@ -139,11 +180,16 @@ app.post("/events", async (req, res) => {
     const bounds = date ? dayBoundsLocal(date) : null;
 
     // helper to build and call SeatGeek
-    const callSeatGeek = async ({ useKeywords = true, useCity = true }) => {
+    const callSeatGeek = async ({
+      useKeywords = true,
+      useCity = true,
+      page = 1,
+    }) => {
       const params = new URLSearchParams({
         client_id: process.env.SEATGEEK_CLIENT_ID,
         per_page: "25",
         sort: "datetime_local.asc",
+        page: String(page),
       });
 
       if (useCity && city) params.set("venue.city", city);
@@ -179,53 +225,79 @@ app.post("/events", async (req, res) => {
       return { items, debug: { url, status: resp.status } };
     };
 
-    // 1) full filters
-    let { items, debug } = await callSeatGeek({
-      useKeywords: true,
-      useCity: true,
-    });
+    const cacheKey = buildCacheKey({ location, interests, date });
+    const searchModes = [
+      { useKeywords: true, useCity: true },
+      { useKeywords: false, useCity: true },
+      { useKeywords: false, useCity: false },
+    ];
 
-    // 2) if empty, drop keywords
-    if (!items.length) {
-      ({ items, debug } = await callSeatGeek({
-        useKeywords: false,
-        useCity: true,
-      }));
+    let cacheEntry = eventCache.get(cacheKey);
+    if (!cacheEntry) {
+      cacheEntry = {
+        items: [],
+        page: 1,
+        modeIndex: null,
+        done: false,
+      };
+      eventCache.set(cacheKey, cacheEntry);
     }
 
-    // 3) if still empty, try only date (ignore city/state too)
-    if (!items.length) {
-      ({ items, debug } = await callSeatGeek({
-        useKeywords: false,
-        useCity: false,
-      }));
+    let debug = null;
+    let newItems = [];
+
+    if (!cacheEntry.done) {
+      if (cacheEntry.modeIndex === null) {
+        for (let i = 0; i < searchModes.length; i += 1) {
+          const { items, debug: modeDebug } = await callSeatGeek({
+            ...searchModes[i],
+            page: cacheEntry.page,
+          });
+          debug = modeDebug;
+          if (items.length) {
+            cacheEntry.modeIndex = i;
+            newItems = items;
+            break;
+          }
+        }
+        if (!newItems.length) {
+          cacheEntry.done = true;
+        }
+      } else {
+        const { items, debug: modeDebug } = await callSeatGeek({
+          ...searchModes[cacheEntry.modeIndex],
+          page: cacheEntry.page,
+        });
+        debug = modeDebug;
+        newItems = items;
+        if (!newItems.length) {
+          cacheEntry.done = true;
+        }
+      }
+
+      if (newItems.length) {
+        cacheEntry.page += 1;
+        const merged = [...cacheEntry.items, ...newItems];
+        cacheEntry.items = dedupeEvents(merged);
+        console.log(
+          `[Dedup] reduced ${merged.length} -> ${cacheEntry.items.length}`
+        );
+      }
     }
 
-    // Deduplicate events by normalized title + venue (group multiple showings of same event)
-    // implemented in a small helper module so it can be unit-tested
-    const deduped = dedupeEvents(items);
-    console.log(`[Dedup] reduced ${items.length} -> ${deduped.length}`);
-
-    // Summarize up to 12 unique events with OpenAI
-    const summaryLimit = 12;
     const summaryConcurrency = 3;
-    const withSnippets = await summarizeEventsWithLimit(
-      deduped.slice(0, summaryLimit),
+    cacheEntry.items = await addSnippetsToEvents(
+      cacheEntry.items,
       summaryConcurrency
     );
 
-    // If there were more events than summarized, append the rest (no snippet)
-    if (deduped.length > withSnippets.length) {
-      withSnippets.push(...deduped.slice(withSnippets.length));
-    }
-
     // Also return just the descriptions
-    const descriptions = withSnippets
+    const descriptions = cacheEntry.items
       .map((e) => e.snippet)
       .filter((s) => typeof s === "string" && s.length > 0);
 
     return res.json({
-      items: withSnippets,
+      items: cacheEntry.items,
       descriptions,
       debug,
     });
